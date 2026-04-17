@@ -13,6 +13,7 @@ Checklist:
   ✅ Security headers
   ✅ CORS
   ✅ Error handling
+  ✅ Conversation history (LangGraph MemorySaver per user_id)
 """
 import os
 import time
@@ -20,19 +21,18 @@ import signal
 import logging
 import json
 from datetime import datetime, timezone
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
-from fastapi.security.api_key import APIKeyHeader
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 
 from app.config import settings
-
-# Mock LLM (thay bằng OpenAI/Anthropic khi có API key)
-from utils.mock_llm import ask as llm_ask
+from app.auth import verify_api_key
+from app.rate_limiter import check_rate_limit
+from app.cost_guard import check_and_record_cost, get_daily_cost
+from app.agent import run_agent
 
 # ─────────────────────────────────────────────────────────
 # Logging — JSON structured
@@ -47,54 +47,6 @@ START_TIME = time.time()
 _is_ready = False
 _request_count = 0
 _error_count = 0
-
-# ─────────────────────────────────────────────────────────
-# Simple In-memory Rate Limiter
-# ─────────────────────────────────────────────────────────
-_rate_windows: dict[str, deque] = defaultdict(deque)
-
-def check_rate_limit(key: str):
-    now = time.time()
-    window = _rate_windows[key]
-    while window and window[0] < now - 60:
-        window.popleft()
-    if len(window) >= settings.rate_limit_per_minute:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min",
-            headers={"Retry-After": "60"},
-        )
-    window.append(now)
-
-# ─────────────────────────────────────────────────────────
-# Simple Cost Guard
-# ─────────────────────────────────────────────────────────
-_daily_cost = 0.0
-_cost_reset_day = time.strftime("%Y-%m-%d")
-
-def check_and_record_cost(input_tokens: int, output_tokens: int):
-    global _daily_cost, _cost_reset_day
-    today = time.strftime("%Y-%m-%d")
-    if today != _cost_reset_day:
-        _daily_cost = 0.0
-        _cost_reset_day = today
-    if _daily_cost >= settings.daily_budget_usd:
-        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
-    _daily_cost += cost
-
-# ─────────────────────────────────────────────────────────
-# Auth
-# ─────────────────────────────────────────────────────────
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-def verify_api_key(api_key: str = Security(api_key_header)) -> str:
-    if not api_key or api_key != settings.agent_api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key. Include header: X-API-Key: <key>",
-        )
-    return api_key
 
 # ─────────────────────────────────────────────────────────
 # Lifespan
@@ -142,7 +94,6 @@ async def request_middleware(request: Request, call_next):
     _request_count += 1
     try:
         response: Response = await call_next(request)
-        # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers.pop("server", None)
@@ -155,7 +106,7 @@ async def request_middleware(request: Request, call_next):
             "ms": duration,
         }))
         return response
-    except Exception as e:
+    except Exception:
         _error_count += 1
         raise
 
@@ -165,10 +116,13 @@ async def request_middleware(request: Request, call_next):
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000,
                           description="Your question for the agent")
+    user_id: str = Field(default="anonymous", max_length=100,
+                         description="User ID used as conversation thread_id")
 
 class AskResponse(BaseModel):
     question: str
     answer: str
+    user_id: str
     model: str
     timestamp: str
 
@@ -186,6 +140,7 @@ def root():
             "ask": "POST /ask (requires X-API-Key)",
             "health": "GET /health",
             "ready": "GET /ready",
+            "metrics": "GET /metrics (requires X-API-Key)",
         },
     }
 
@@ -200,21 +155,22 @@ async def ask_agent(
     Send a question to the AI agent.
 
     **Authentication:** Include header `X-API-Key: <your-key>`
-    """
-    # Rate limit per API key
-    check_rate_limit(_key[:8])  # use first 8 chars as key bucket
 
-    # Budget check
+    **Conversation history:** Use the same `user_id` across requests to maintain context.
+    """
+    check_rate_limit(_key[:8])
+
     input_tokens = len(body.question.split()) * 2
     check_and_record_cost(input_tokens, 0)
 
     logger.info(json.dumps({
         "event": "agent_call",
+        "user_id": body.user_id,
         "q_len": len(body.question),
         "client": str(request.client.host) if request.client else "unknown",
     }))
 
-    answer = llm_ask(body.question)
+    answer = run_agent(body.question, thread_id=body.user_id)
 
     output_tokens = len(answer.split()) * 2
     check_and_record_cost(0, output_tokens)
@@ -222,6 +178,7 @@ async def ask_agent(
     return AskResponse(
         question=body.question,
         answer=answer,
+        user_id=body.user_id,
         model=settings.llm_model,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
@@ -230,15 +187,13 @@ async def ask_agent(
 @app.get("/health", tags=["Operations"])
 def health():
     """Liveness probe. Platform restarts container if this fails."""
-    status = "ok"
-    checks = {"llm": "mock" if not settings.openai_api_key else "openai"}
     return {
-        "status": status,
+        "status": "ok",
         "version": settings.app_version,
         "environment": settings.environment,
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "total_requests": _request_count,
-        "checks": checks,
+        "checks": {"llm": "openai/gpt-4o-mini"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -254,13 +209,14 @@ def ready():
 @app.get("/metrics", tags=["Operations"])
 def metrics(_key: str = Depends(verify_api_key)):
     """Basic metrics (protected)."""
+    daily_cost = get_daily_cost()
     return {
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "total_requests": _request_count,
         "error_count": _error_count,
-        "daily_cost_usd": round(_daily_cost, 4),
+        "daily_cost_usd": round(daily_cost, 4),
         "daily_budget_usd": settings.daily_budget_usd,
-        "budget_used_pct": round(_daily_cost / settings.daily_budget_usd * 100, 1),
+        "budget_used_pct": round(daily_cost / settings.daily_budget_usd * 100, 1),
     }
 
 

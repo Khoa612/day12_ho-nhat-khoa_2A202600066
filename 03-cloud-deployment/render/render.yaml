@@ -12,35 +12,35 @@ services:
   - type: web
     name: ai-agent
     runtime: python
-    region: singapore         # Chọn region gần user nhất
-    plan: free                # free | starter | standard | pro
+    region: singapore
+    plan: free
+    rootDir: 06-lab-complete
 
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
-    healthCheckPath: /health   # Render check path này
-
-    autoDeploy: true           # Auto deploy khi push to GitHub
+    healthCheckPath: /health
+    autoDeploy: true
 
     envVars:
       - key: ENVIRONMENT
         value: production
       - key: PYTHON_VERSION
-        value: 3.11.0
-      # Secrets — set qua Render Dashboard (không commit giá trị thật)
-      - key: OPENAI_API_KEY
-        sync: false            # sync: false = set thủ công trên dashboard
+        value: "3.11.0"
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: agent-cache
+          property: connectionString
       - key: AGENT_API_KEY
-        generateValue: true    # Render tự sinh random value
-
-    # Disk (nếu agent cần lưu file)
-    # disk:
-    #   name: agent-data
-    #   mountPath: /data
-    #   sizeGB: 1
+        generateValue: true
+      - key: DAILY_BUDGET_USD
+        value: "5.0"
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "20"
 
   # ──────────────────────────────────────
-  # Redis (dùng Render Redis add-on)
+  # Redis
   # ──────────────────────────────────────
   - type: redis
     name: agent-cache
@@ -52,6 +52,6 @@ services:
 # Cách deploy:
 #   1. Push code lên GitHub
 #   2. Render Dashboard → New → Blueprint
-#   3. Connect repo → Render đọc render.yaml này
+#   3. Connect repo → Chọn file: 03-cloud-deployment/render/render.yaml
 #   4. Review và Deploy
 # ============================================================
